@@ -1,4 +1,8 @@
-import { BigNumberInput, PaymentDTO } from "@medusajs/framework/types"
+import {
+  BigNumberInput,
+  IOrderModuleService,
+  PaymentDTO,
+} from "@medusajs/framework/types"
 import {
   BigNumber,
   defaultCurrencies,
@@ -6,9 +10,13 @@ import {
   MathBN,
   MedusaError,
   PaymentEvents,
+  OrderChangeStatus,
+  OrderStatus,
+  Modules,
 } from "@medusajs/framework/utils"
 import {
   createStep,
+  StepResponse,
   createWorkflow,
   transform,
   when,
@@ -116,6 +124,50 @@ export const validateRefundPaymentExceedsCapturedAmountStep = createStep(
   }
 )
 
+const validateRefundOrderStateStep = createStep(
+  "validate-refund-order-state",
+  async (
+    data: {
+      orderId: string
+      creditLineAmount: BigNumberInput
+      isReplay: boolean
+      refundInput: RefundPaymentWorkflowInput
+    },
+    { container }
+  ) => {
+    if (!data.isReplay && MathBN.gt(data.creditLineAmount, 0)) {
+      const orderModule = container.resolve<IOrderModuleService>(
+        Modules.ORDER
+      )
+
+      const order = await orderModule.retrieveOrder(data.orderId)
+
+      if (order.status === OrderStatus.CANCELED) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `Order with id ${order.id} has been canceled.`
+        )
+      }
+
+      const activeChanges = await orderModule.listOrderChanges({
+        order_id: data.orderId,
+        status: [
+          OrderChangeStatus.PENDING,
+          OrderChangeStatus.REQUESTED,
+        ],
+      })
+
+      if (activeChanges.length > 0) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `Order (${order.id}) already has an existing active order change`
+        )
+      }
+    }
+
+    return new StepResponse(data.refundInput)
+  }
+)
 export const refundPaymentWorkflowId = "refund-payment-workflow"
 /**
  * This workflow refunds a payment. It's used by the
@@ -247,8 +299,6 @@ export const refundPaymentWorkflow = createWorkflow(
       ({ refundTransaction }) => !!refundTransaction?.id
     )
 
-    const refundPayment = refundPaymentStep(input)
-
     const creditLineAmount = transform(
       { order, payment, input },
       ({ order, payment, input }) => {
@@ -271,6 +321,14 @@ export const refundPaymentWorkflow = createWorkflow(
       }
     )
 
+    const validatedRefundInput = validateRefundOrderStateStep({
+      orderId: order.id,
+      creditLineAmount,
+      isReplay,
+      refundInput: input,
+    })
+
+    const refundPayment = refundPaymentStep(validatedRefundInput)
     // Always run, replay or not: the step skips transactions it already wrote,
     // so a retry after a half-finished attempt still records the refund.
     when({ orderPaymentCollection }, ({ orderPaymentCollection }) => {

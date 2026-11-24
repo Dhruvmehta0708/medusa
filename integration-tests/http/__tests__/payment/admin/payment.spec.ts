@@ -1,6 +1,11 @@
 import { refundPaymentsWorkflow } from "@medusajs/core-flows"
 import { medusaIntegrationTestRunner } from "@medusajs/test-utils"
-import { ClaimType, Modules } from "@medusajs/utils"
+import {
+  ClaimType,
+  Modules,
+  OrderChangeStatus,
+  OrderChangeType,
+} from "@medusajs/utils"
 import {
   adminHeaders,
   createAdminUser,
@@ -271,6 +276,92 @@ medusaIntegrationTestRunner({
           })
         )
       })
+
+      it.each([
+        OrderChangeStatus.PENDING,
+        OrderChangeStatus.REQUESTED,
+      ])(
+        "should reject a refund before moving funds when an order change is %s",
+        async (status) => {
+          const paymentModule = container.resolve(Modules.PAYMENT)
+          const orderModule = container.resolve(Modules.ORDER)
+          const payment = order.payment_collections[0].payments[0]
+
+          await api.post(
+            `/admin/payments/${payment.id}/capture`,
+            undefined,
+            adminHeaders
+          )
+
+          const orderChange = await orderModule.createOrderChange({
+            order_id: order.id,
+            change_type: OrderChangeType.EDIT,
+          })
+
+          await orderModule.updateOrderChanges({
+            id: orderChange.id,
+            status,
+          })
+
+          const persistedChange =
+            await orderModule.retrieveOrderChange(orderChange.id)
+
+          expect(persistedChange.status).toEqual(status)
+
+          const before = (
+            await api.get(`/admin/orders/${order.id}`, adminHeaders)
+          ).data.order
+
+          const providerRefundSpy = jest.spyOn(
+            (paymentModule as any).paymentProviderService_,
+            "refundPayment"
+          )
+
+          try {
+            const error = await api
+              .post(
+                `/admin/payments/${payment.id}/refund`,
+                { amount: 50 },
+                adminHeaders
+              )
+              .catch((e) => e)
+
+            expect(error.response.status).toEqual(400)
+            expect(error.response.data.message).toEqual(
+              `Order (${order.id}) already has an existing active order change`
+            )
+
+            expect(providerRefundSpy).not.toHaveBeenCalled()
+
+            expect(
+              await paymentModule.listRefunds({
+                payment_id: payment.id,
+              })
+            ).toHaveLength(0)
+
+            expect(
+              await orderModule.listOrderTransactions({
+                order_id: order.id,
+                reference: "refund",
+              })
+            ).toHaveLength(0)
+
+            const after = (
+              await api.get(`/admin/orders/${order.id}`, adminHeaders)
+            ).data.order
+
+            expect(after.credit_lines).toEqual(before.credit_lines)
+            expect(after.credit_line_total).toEqual(
+              before.credit_line_total
+            )
+            expect(after.summary.refunded_total).toEqual(
+              before.summary.refunded_total
+            )
+          } finally {
+            providerRefundSpy.mockRestore()
+          }
+        }
+      )
 
       it("should forward a caller-supplied idempotency key to the provider", async () => {
         const paymentModule = container.resolve(Modules.PAYMENT)
